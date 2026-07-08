@@ -1,0 +1,14 @@
+# SwiftPM build products
+.build/
+.swiftpm/
+Package.resolved
+
+# Never commit voice-note audio or transcripts (T2 personal PII)
+*.ogg
+*.opus
+*.oga
+*.m4a
+*.wav
+*.caf
+*.aiff
+*.txt
