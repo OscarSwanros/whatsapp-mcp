@@ -7,7 +7,9 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# Message DB lives out-of-tree under the user's config dir (C4 / HMB-327),
+# never inside the repo. os.path.expanduser DOES expand '~' (unlike Go).
+MESSAGES_DB_PATH = os.path.join(os.path.expanduser('~'), '.config', 'homebase', 'whatsapp', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass

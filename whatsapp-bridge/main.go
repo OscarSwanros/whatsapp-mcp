@@ -40,15 +40,48 @@ type MessageStore struct {
 	db *sql.DB
 }
 
-// Initialize message store
-func NewMessageStore() (*MessageStore, error) {
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create store directory: %v", err)
+// whatsappDataDir resolves the out-of-tree directory that holds the WhatsApp
+// session DB, the message DB, and downloaded media. Everything sensitive lives
+// under ~/.config/homebase/whatsapp (created 0700, owner-only) — NEVER inside
+// the repo tree. Go does not expand "~", so the home dir is resolved explicitly.
+func whatsappDataDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve home directory: %v", err)
 	}
+	dir := filepath.Join(home, ".config", "homebase", "whatsapp")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("failed to create data directory %s: %v", dir, err)
+	}
+	return dir, nil
+}
 
+// enforceMode600 REFUSES TO START if path exists and is not EXACTLY mode 0600.
+// A world/group-readable session/message DB is a custody failure — the session
+// DB holds the linked-device credentials — so we log a clear error and exit(1)
+// before connecting. A missing file is fine (first run). Mirrors
+// enforce_mode_600 in scripts/mcp/drive-user-mcp/server.py.
+func enforceMode600(path, what string, logger waLog.Logger) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return // first run — nothing to enforce yet
+		}
+		logger.Errorf("REFUSING TO START: cannot stat %s at %s: %v", what, path, err)
+		os.Exit(1)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		logger.Errorf("REFUSING TO START: %s at %s is mode %04o, must be exactly 0600 "+
+			"(owner read/write only, no group/other). Fix it: chmod 600 %q", what, path, mode, path)
+		os.Exit(1)
+	}
+}
+
+// Initialize message store at the given (out-of-tree) path. The DB file is
+// chmod'd to 0600 after creation so message history stays owner-only.
+func NewMessageStore(dbPath string) (*MessageStore, error) {
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -82,6 +115,12 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Lock the message DB down to owner-only (SQLite creates it at umask perms).
+	if err := os.Chmod(dbPath, 0o600); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to secure message database permissions: %v", err)
 	}
 
 	return &MessageStore{db: db}, nil
@@ -373,8 +412,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	// First, check if we already have this file. Media lives out-of-tree under
+	// the same data dir as the databases (C4), one subdir per chat.
+	dataDir, err := whatsappDataDir()
+	if err != nil {
+		return false, "", "", "", err
+	}
+	chatDir := filepath.Join(dataDir, strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -397,13 +441,15 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
-	// Create directory for the chat if it doesn't exist
-	if err := os.MkdirAll(chatDir, 0755); err != nil {
+	// Create directory for the chat if it doesn't exist (owner-only, 0700)
+	if err := os.MkdirAll(chatDir, 0700); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Generate a local path for the file. Sanitize the sender-controlled
+	// filename with filepath.Base (C7) so a malicious "../.." name cannot
+	// escape the chat's store dir.
+	localPath = filepath.Join(chatDir, filepath.Base(filename))
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)
@@ -562,16 +608,32 @@ func main() {
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
-	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
-		logger.Errorf("Failed to create store directory: %v", err)
-		return
+	// Resolve the out-of-tree data directory (C4): both databases live under
+	// ~/.config/homebase/whatsapp (0700), never inside the repo tree.
+	dataDir, err := whatsappDataDir()
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
 	}
+	sessionDBPath := filepath.Join(dataDir, "whatsapp.db")
+	messagesDBPath := filepath.Join(dataDir, "messages.db")
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	// Refuse to start if an existing DB is not owner-only (0600). The session DB
+	// holds the linked-device credentials; a group/world-readable copy is a
+	// custody failure, so we exit(1) before connecting.
+	enforceMode600(sessionDBPath, "WhatsApp session database", logger)
+	enforceMode600(messagesDBPath, "WhatsApp message database", logger)
+
+	container, err := sqlstore.New("sqlite3", "file:"+sessionDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
+	}
+
+	// Lock the session DB down to owner-only (0600) after sqlstore created it.
+	if err := os.Chmod(sessionDBPath, 0o600); err != nil {
+		logger.Errorf("Failed to secure session database permissions: %v", err)
+		os.Exit(1)
 	}
 
 	// Get device store - This contains session information
@@ -595,7 +657,7 @@ func main() {
 	}
 
 	// Initialize message store
-	messageStore, err := NewMessageStore()
+	messageStore, err := NewMessageStore(messagesDBPath)
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
 		return
