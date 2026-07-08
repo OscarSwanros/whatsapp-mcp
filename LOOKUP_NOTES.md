@@ -27,3 +27,14 @@ linked, or an old message): WhatsApp's CDN won't re-serve expired media referenc
 linked device. **Real-time media** (received while the bridge is connected) downloads fine.
 Workaround for a specific old note: **forward it in WhatsApp** — that creates fresh media the
 bridge can fetch. Captured 2026-07-08 (Miriam voice note 1:35pm, received pre-link → 403).
+
+## The RIGHT lookup — use whatsmeow's live mapping, don't copy it
+whatsmeow already maintains the authoritative, LIVE mapping in the SESSION store
+(`whatsapp.db`): `whatsmeow_lid_map(lid, pn)` + `whatsmeow_contacts(their_jid, full_name,
+push_name, business_name)`. Do NOT snapshot it into a separate table — it drifts. Resolve by
+name / number / LID against these live tables. Helper: `wa-find.py "Miriam" --messages 5`.
+
+## CORRECTION to the 403 note above
+Real-time media ALSO 403s — the earlier "real-time downloads fine" was wrong. Root cause is a
+bridge download-auth bug (it uses the stored CDN url whose oe/oh go stale, instead of
+re-deriving creds via whatsmeow's media connection). Fix in progress under HMB-327.
