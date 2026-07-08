@@ -20,3 +20,10 @@ while the bridge is connected.
 
 _Captured 2026-07-08 after a Miriam-Vera DM lookup missed on both number and name (chat keyed
 `210736932511940@lid`), located by content. Refs HMB-327. Graduate into standards/PERSONAL_DOMAIN.md when that scaffolding lands._
+
+## Media download 403 — historical media may be unfetchable
+`/api/download` can return **403** for media received via history sync (before the device
+linked, or an old message): WhatsApp's CDN won't re-serve expired media references to a
+linked device. **Real-time media** (received while the bridge is connected) downloads fine.
+Workaround for a specific old note: **forward it in WhatsApp** — that creates fresh media the
+bridge can fetch. Captured 2026-07-08 (Miriam voice note 1:35pm, received pre-link → 403).
