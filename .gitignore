@@ -4,3 +4,5 @@ whatsapp.log
 # Datastore + media relocated out of the repo tree (C4 / HMB-327); ignore any
 # residual in-repo store/ dir as belt-and-suspenders.
 store/
+# compiled bridge binary
+whatsapp-bridge/whatsapp-bridge

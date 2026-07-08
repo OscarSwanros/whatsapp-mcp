@@ -701,6 +701,11 @@ func main() {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				// Headless pairing: emit the raw QR payload on an opt-in env flag so
+				// tooling can render a clean image (never printed in normal use).
+				if os.Getenv("WA_HEADLESS_QR") == "1" {
+					fmt.Println("WA_QR_RAW::" + evt.Code)
+				}
 			} else if evt.Event == "success" {
 				connected <- true
 				break
