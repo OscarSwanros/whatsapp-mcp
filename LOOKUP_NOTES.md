@@ -38,3 +38,18 @@ name / number / LID against these live tables. Helper: `wa-find.py "Miriam" --me
 Real-time media ALSO 403s — the earlier "real-time downloads fine" was wrong. Root cause is a
 bridge download-auth bug (it uses the stored CDN url whose oe/oh go stale, instead of
 re-deriving creds via whatsmeow's media connection). Fix in progress under HMB-327.
+
+## CORRECTION to the lookup note above (HMB-336) — never resolve a NAME by contact substring
+The "resolve by name … against these live tables" guidance was DANGEROUS for the send path: a
+substring match against `whatsmeow_contacts` conflated a person's short nickname with a
+DIFFERENT contact whose surname merely contained it (and every same-first-name contact in the
+address book), and a wrong mapping is a wrong recipient. New rule:
+- **A NAME resolves ONLY via the VERIFIED mapping** — the mode-600 `identity.md`
+  name↔number↔LID↔chat_jid table + the `resolved-chats` pins in `monitoring-scope.md`. `wa-find.py`
+  now matches a name against those verified people (or an exact scope label), never the address book;
+  an unknown name is REFUSED, not guessed.
+- **A NUMBER / LID still resolves exactly** against the live `whatsmeow_lid_map` + chat list,
+  self-healed across a LID migration. `whatsmeow_contacts` is no longer read for matching at all.
+`wa-find.py <verified name|label> --messages 5` still works for anyone in the verified table; a
+name not in the table returns a refusal telling you to add it to `identity.md` or query by
+label/number.
