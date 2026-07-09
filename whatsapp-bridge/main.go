@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -75,6 +78,105 @@ func enforceMode600(path, what string, logger waLog.Logger) {
 			"(owner read/write only, no group/other). Fix it: chmod 600 %q", what, path, mode, path)
 		os.Exit(1)
 	}
+}
+
+// sendTokenPath resolves the file that holds the bearer token gating /api/send.
+// It lives beside the databases under ~/.config/homebase/whatsapp so the whole
+// custody surface is one owner-only (0700) directory.
+func sendTokenPath() (string, error) {
+	dir, err := whatsappDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "send-token"), nil
+}
+
+// loadOrCreateSendToken returns the exact bearer token that every /api/send
+// request must present. On first run it generates a cryptographically-random
+// 256-bit token and writes it 0600. On subsequent runs it reads the existing
+// token but REFUSES TO START if the file is not EXACTLY mode 0600 — a
+// group/world-readable send token would let ANY local process drive the linked
+// WhatsApp account, which is the very thing loopback-binding + this token exist
+// to prevent, so a custody failure halts the bridge (mirrors enforceMode600 for
+// the session/message DBs). This function is the ONLY writer of the token; the
+// cockpit send-gate is the only intended reader.
+func loadOrCreateSendToken(logger waLog.Logger) string {
+	path, err := sendTokenPath()
+	if err != nil {
+		logger.Errorf("REFUSING TO START: %v", err)
+		os.Exit(1)
+	}
+
+	info, statErr := os.Stat(path)
+	if statErr == nil {
+		// Existing token — enforce exact 0600 before trusting it.
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			logger.Errorf("REFUSING TO START: send token at %s is mode %04o, must be exactly 0600 "+
+				"(owner read/write only, no group/other). It may be compromised — regenerate it: "+
+				"rm %q && restart. Or fix perms: chmod 600 %q", path, mode, path, path)
+			os.Exit(1)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			logger.Errorf("REFUSING TO START: cannot read send token at %s: %v", path, err)
+			os.Exit(1)
+		}
+		token := strings.TrimSpace(string(data))
+		if token == "" {
+			logger.Errorf("REFUSING TO START: send token at %s is empty; delete it to regenerate", path)
+			os.Exit(1)
+		}
+		logger.Infof("Loaded /api/send bearer token from %s (mode 0600)", path)
+		return token
+	}
+	if !os.IsNotExist(statErr) {
+		logger.Errorf("REFUSING TO START: cannot stat send token at %s: %v", path, statErr)
+		os.Exit(1)
+	}
+
+	// First run — generate a fresh 256-bit token and persist it owner-only.
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		logger.Errorf("REFUSING TO START: failed to generate send token: %v", err)
+		os.Exit(1)
+	}
+	token := hex.EncodeToString(raw)
+
+	// O_EXCL: never clobber a token that raced in between the stat and now.
+	// The 0600 create mode plus the explicit Chmod below guarantee exactly 0600
+	// regardless of the process umask.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		logger.Errorf("REFUSING TO START: failed to create send token at %s: %v", path, err)
+		os.Exit(1)
+	}
+	if _, err := f.WriteString(token); err != nil {
+		f.Close()
+		logger.Errorf("REFUSING TO START: failed to write send token at %s: %v", path, err)
+		os.Exit(1)
+	}
+	if err := f.Close(); err != nil {
+		logger.Errorf("REFUSING TO START: failed to close send token at %s: %v", path, err)
+		os.Exit(1)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		logger.Errorf("REFUSING TO START: failed to secure send token at %s: %v", path, err)
+		os.Exit(1)
+	}
+	logger.Infof("Generated new /api/send bearer token at %s (mode 0600)", path)
+	return token
+}
+
+// presentedSendToken pulls the caller's token from the request: either an
+// "Authorization: Bearer <token>" header or an "X-Send-Token: <token>" header.
+// Returns "" when neither is present.
+func presentedSendToken(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if rest, ok := strings.CutPrefix(auth, "Bearer "); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return strings.TrimSpace(r.Header.Get("X-Send-Token"))
 }
 
 // Initialize message store at the given (out-of-tree) path. The DB file is
@@ -270,6 +372,51 @@ func extractTextContent(msg *waProto.Message) string {
 
 	// For now, we're ignoring non-text messages
 	return ""
+}
+
+// SendMessageRequest is the /api/send request body. Text messages ONLY for now
+// (HMB-333 Phase 2); media send is deliberately out of scope until a later phase.
+type SendMessageRequest struct {
+	RecipientJID string `json:"recipient_jid"`
+	Text         string `json:"text"`
+}
+
+// SendMessageResponse is the /api/send result. MessageID is the whatsmeow-assigned
+// id of the sent message, present only on success.
+type SendMessageResponse struct {
+	Success   bool   `json:"success"`
+	Message   string `json:"message"`
+	MessageID string `json:"message_id,omitempty"`
+}
+
+// sendTextMessage sends a plain-text WhatsApp message via whatsmeow's
+// SendMessage. Text only — media is intentionally unsupported here (Phase 2
+// scope). Returns (ok, messageID, humanMessage).
+func sendTextMessage(ctx context.Context, client *whatsmeow.Client, recipientJID, text string) (bool, string, string) {
+	if !client.IsConnected() {
+		return false, "", "Not connected to WhatsApp"
+	}
+
+	var jid types.JID
+	var err error
+	if strings.Contains(recipientJID, "@") {
+		jid, err = types.ParseJID(recipientJID)
+		if err != nil {
+			return false, "", fmt.Sprintf("Invalid recipient JID: %v", err)
+		}
+	} else {
+		// Bare phone number → personal chat JID.
+		jid = types.JID{User: recipientJID, Server: "s.whatsapp.net"}
+	}
+
+	// Conversation is a *string; take the address of the local copy so we avoid
+	// pulling in google.golang.org/protobuf just for proto.String.
+	msg := &waProto.Message{Conversation: &text}
+	resp, err := client.SendMessage(ctx, jid, msg)
+	if err != nil {
+		return false, "", fmt.Sprintf("Error sending message: %v", err)
+	}
+	return true, resp.ID, fmt.Sprintf("Message sent to %s", jid.String())
 }
 
 // Extract media info from a message. DirectPath is captured alongside URL: as
@@ -559,7 +706,69 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, sendToken string, port int) {
+	// Handler for sending text messages. LOCKED DOWN (HMB-333 Phase 2): the
+	// listener binds loopback-only (see the bind at the bottom of this func) AND
+	// every request must present the exact bearer token from the 0600
+	// send-token file. Together those two properties mean ONLY the cockpit
+	// send-gate — the sole holder of the token — can send: no other local
+	// process, and nothing off-host, can reach or authenticate to this route.
+	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Auth gate FIRST — before we read or parse the body. Missing token =>
+		// 401; present-but-wrong => 403. The compare is constant-time so a
+		// local attacker cannot recover the token via response timing.
+		presented := presentedSendToken(r)
+		if presented == "" {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "Missing send token", http.StatusUnauthorized)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(presented), []byte(sendToken)) != 1 {
+			http.Error(w, "Invalid send token", http.StatusForbidden)
+			return
+		}
+
+		// Parse the request body
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		// Validate request
+		if req.RecipientJID == "" {
+			http.Error(w, "recipient_jid is required", http.StatusBadRequest)
+			return
+		}
+		if req.Text == "" {
+			http.Error(w, "text is required", http.StatusBadRequest)
+			return
+		}
+
+		// Send the message
+		success, messageID, message := sendTextMessage(r.Context(), client, req.RecipientJID, req.Text)
+
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success:   success,
+			Message:   message,
+			MessageID: messageID,
+		})
+	})
+
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -613,7 +822,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Start the server. Bind to loopback ONLY (C2): the bridge's REST surface
 	// must never be reachable from the LAN/VPN — only local processes on this
-	// host (the MCP server) may reach /api/download.
+	// host may reach it. /api/download is loopback-gated; /api/send is
+	// loopback-gated AND bearer-token-gated (cockpit send-gate only).
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
@@ -648,6 +858,11 @@ func main() {
 	// custody failure, so we exit(1) before connecting.
 	enforceMode600(sessionDBPath, "WhatsApp session database", logger)
 	enforceMode600(messagesDBPath, "WhatsApp message database", logger)
+
+	// Load (or first-run generate) the bearer token that gates /api/send. This
+	// refuses to start on a mis-permissioned token, so custody is verified
+	// before we ever connect — same posture as the DB checks above.
+	sendToken := loadOrCreateSendToken(logger)
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:"+sessionDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -766,7 +981,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, sendToken, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
